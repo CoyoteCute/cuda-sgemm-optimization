@@ -1,0 +1,8 @@
+build/
+*.o
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+*.csv
+.vscode/
+__pycache__/
