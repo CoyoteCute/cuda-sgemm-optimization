@@ -24,3 +24,5 @@ metric that explains the delta.
 6. TMA — 4.12.2                         (needs sm_90+; not this GPU)
 7. Clusters / DSMEM / work stealing — 2.1.10, 3.1.2, 2.3.3.8, 4.13
 8. Tile kernels (cuTile) — 1.2.2.3, 2.4                [last]
+
+correct FP32 kernels report max rel ~2e-5 at M=512, N=K=1024, seeds 42/1337.
