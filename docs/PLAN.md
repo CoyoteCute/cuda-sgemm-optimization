@@ -26,3 +26,5 @@ metric that explains the delta.
 8. Tile kernels (cuTile) — 1.2.2.3, 2.4                [last]
 
 correct FP32 kernels report max rel ~2e-5 at M=512, N=K=1024, seeds 42/1337.
+# baseline naive kernel
+- 1.203 ms     892.55 GFLOP/s    5.51% of peak
