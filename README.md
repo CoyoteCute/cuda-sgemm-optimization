@@ -110,3 +110,58 @@ Verify the toolchain and profiler counter access:
     Average SMSP Active Cycles       cycle         5.83
     Total SMSP Elapsed Cycles        cycle       402824
     -------------------------- ----------- ------------
+
+## Build and run
+
+    $make                      # builds build/test_gemm
+    $make test                 # builds, then runs every registered kernel
+    $make test K=naive         # only kernels whose name contains "naive"
+
+`make test` fills A and B from fixed seeds (42 / 1337), computes the
+reference once with the CPU kernel, then for every registered GPU kernel
+checks it against that reference before timing it:
+
+    $make test K=naive
+    M=512 K=1024 N=1024   reference: CPU
+
+    [naive]
+      worst at (288,0): gpu=0.025224 ref=0.025216
+      max rel err: 2.382e-05  [pass]
+         1.201 ms     893.93 GFLOP/s    5.52% of peak
+
+    1/1 passed
+
+A kernel is timed only if it passes. Tolerance is 1e-4 (`tests/test_gemm.cu`):
+FP32 accumulation over K=1024 lands near 2e-5 against the double-accumulating
+CPU reference, so the check catches a broken kernel, not a differently-rounded
+one. Exit status is 0 when every kernel that ran passed, 1 otherwise.
+
+Profiling one kernel, without the warmup and timing launches getting in the way:
+
+    $ncu --set basic --launch-count 1 build/test_gemm naive
+
+Other targets:
+
+    $make smoke                # toolchain + profiler check, as above
+    $make clean                # objects and build/test_gemm
+    $make ARCH=sm_80           # a different GPU
+
+## Adding a kernel
+
+Three edits. No build change -- the Makefile globs `src/kernels/*.cu`.
+
+1. `src/kernels/<name>.cu` -- the `__global__` plus a host launcher matching
+   `GemmFn` in `src/gemm.h`. Keep the `<<<>>>` in this file: the driver then
+   links against a plain host function and needs no `-rdc=true`. Block shape
+   and grid math are the kernel's own business, not the driver's.
+2. `src/kernels/kernels.h` -- declare the launcher.
+3. `src/registry.cu` -- add `{"<name>", launch_<name>},` to the table.
+
+`make test` then runs the old and new kernels against the same reference in
+one invocation, which is the before/after the ladder in `docs/PLAN.md` asks for.
+
+# Naive kernel
+requests issued:        2 · M·N·K        = 4.3 GB
+after coalescing:       ÷ 32 on A, ÷ 8 on B
+after L1 reuse:         ÷ 32 more on B
+what reaches DRAM:      roughly M·K + N·K · (number of blocks that touch it)
