@@ -1,8 +1,9 @@
 NVCC ?= nvcc
 CXX  ?= g++
 ARCH ?= sm_86
-OPT  ?= -O2
+OPT  ?= -O3
 INC  := -Isrc
+NVCCFLAGS = -arch=$(ARCH) $(OPT) -lineinfo 
 # -MMD -MP: emit a .d per object listing the headers it pulled in, so editing
 # gemm.h or harness.cuh rebuilds what actually included it.
 DEP  := -MMD -MP
@@ -16,20 +17,21 @@ OBJ     := $(CU_SRC:%.cu=build/%.o) $(CPP_SRC:%.cpp=build/%.o)
 .PHONY: all test smoke clean
 all: build/test_gemm
 
+# make test K=smem CASE=aligned -- both optional
 test: build/test_gemm
-	./build/test_gemm $(K)
+	./build/test_gemm $(if $(CASE),-c $(CASE)) $(K)
 
 build/test_gemm: $(OBJ)
 	@mkdir -p $(dir $@)
-	$(NVCC) -arch=$(ARCH) $^ -o $@
+	$(NVCC) -arch=$(ARCH) $^ -Xcompiler -fopenmp -o $@
 
 build/%.o: %.cu
 	@mkdir -p $(dir $@)
-	$(NVCC) -arch=$(ARCH) $(OPT) $(INC) $(DEP) -c $< -o $@
+	$(NVCC) $(NVCCFLAGS) $(INC) $(DEP) -c $< -o $@
 
 build/%.o: %.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(OPT) $(INC) $(DEP) -c $< -o $@
+	$(CXX) $(OPT) -fopenmp $(INC) $(DEP) -c $< -o $@
 
 smoke: tools/smoke_test.cu
 	@mkdir -p build
