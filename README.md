@@ -118,37 +118,43 @@ Verify the toolchain and profiler counter access:
     $make test K=naive         # only kernels whose name contains "naive"
     $make test CASE=aligned    # only the aligned shape (exact name); combines with K=
     $./build/test_gemm -n -c aligned registerTV   # time only, skip the CPU reference and check
+    
+    Other targets:
+    $make smoke                # toolchain + profiler check, as above
+    $make clean                # objects and build/test_gemm
+    $make clean && make        # full rebuild from nothing
+    $make ARCH=sm_80           # a different GPU
+    $make clean && make OPT="-O2 -Xptxas -v"   # registers/spills per kernel
 
-**Current state:** `registerT` has no bounds checks yet. It passes `aligned`
-and crashes on `ragged` with `cudaErrorIllegalAddress`, which stops the whole
-run, so use `make test CASE=aligned` until the checks are in.
+    Header dependencies are tracked (`-MMD -MP`), so editing `gemm.h` or
+    `harness.cuh` rebuilds exactly the objects that included it. `make` reporting
+    `Nothing to be done for 'all'` means the binary is genuinely current.
 
-`make test` checks every registered kernel against the CPU reference on two
-shapes, and times it on the one where a time means something. With `naive`
-and `smem` registered:
-
-    $make test
-    reference: CPU   tol 1e-04
+## Current state 
+    $ ./build/test_gemm -c aligned
+    reference: CPU   tol 1e-04   case "aligned"
 
     === aligned   M=512 K=1024 N=1024 ===
     [naive]
-      worst at (288,0): gpu=0.025224 ref=0.025216
-      max rel err: 2.382e-05  [pass]
-         1.217 ms     881.94 GFLOP/s    5.44% of peak
+    worst at (288,0): gpu=0.025224 ref=0.025216
+    max rel err: 2.382e-05  [pass]
+        1.202 ms     893.17 GFLOP/s    5.51% of peak
     [smem]
-      worst at (288,0): gpu=0.025224 ref=0.025216
-      max rel err: 2.382e-05  [pass]
-         0.979 ms    1096.73 GFLOP/s    6.77% of peak
-
-    === ragged   M=513 K=1025 N=1025 ===
-    [naive]
-      worst at (128,316): gpu=0.024801 ref=0.024792
-      max rel err: 2.781e-05  [pass]
-    [smem]
-      worst at (128,316): gpu=0.024801 ref=0.024792
-      max rel err: 2.781e-05  [pass]
-
-    4/4 passed
+    worst at (288,0): gpu=0.025224 ref=0.025216
+    max rel err: 2.382e-05  [pass]
+        0.977 ms    1099.28 GFLOP/s    6.79% of peak
+    [registerT]
+    worst at (288,0): gpu=0.025224 ref=0.025216
+    max rel err: 2.382e-05  [pass]
+        0.240 ms    4468.56 GFLOP/s   27.58% of peak
+    [rt]
+    worst at (288,0): gpu=0.025224 ref=0.025216
+    max rel err: 2.382e-05  [pass]
+        0.260 ms    4128.25 GFLOP/s   25.48% of peak
+    [rt_V_AsBs]
+    worst at (288,0): gpu=0.025224 ref=0.025216
+    max rel err: 2.382e-05  [pass]
+        0.232 ms    4619.28 GFLOP/s   28.51% of peak
 
 **aligned** has every dim a multiple of 32, so no kernel in the ladder ever
 runs a partial tile. It carries the sweep: the GFLOP/s in `docs/PLAN.md` are
@@ -169,6 +175,7 @@ near 2e-5 against the CPU reference (also float, different summation order), so 
 broken kernel, not a differently-rounded one. Exit status is 0 when every
 kernel that ran passed, 1 otherwise.
 
+## profiling
 Profiling one kernel, without the warmup and timing launches getting in the way:
 
     $ncu --set full -k register_tiling_kernel -c 1 -o registerT \
@@ -178,18 +185,6 @@ Profiling one kernel, without the warmup and timing launches getting in the way:
 reference, no check and no timing loop. Without it, ncu still waits for the
 CPU reference to finish. `-k` takes the `__global__` function name; the last
 argument takes the registry name.
-
-Other targets:
-
-    $make smoke                # toolchain + profiler check, as above
-    $make clean                # objects and build/test_gemm
-    $make clean && make        # full rebuild from nothing
-    $make ARCH=sm_80           # a different GPU
-    $make clean && make OPT="-O2 -Xptxas -v"   # registers/spills per kernel
-
-Header dependencies are tracked (`-MMD -MP`), so editing `gemm.h` or
-`harness.cuh` rebuilds exactly the objects that included it. `make` reporting
-`Nothing to be done for 'all'` means the binary is genuinely current.
 
 ## Adding a kernel
 
@@ -389,4 +384,92 @@ at 4096, a 21% gain, and it is now the fastest kernel in the ladder. Padding
 on top of that is still a loss; see "PAD does not pay here" above.
 
 ## Double buffering
+
+`rt_async` replaces the global -> shared load of B with
+`__pipeline_memcpy_async` (SASS `LDGSTS.E.BYPASS.128`, 16 bytes per thread) and
+double-buffers `Bs`. The copy for tile `t+1` is issued at the top of iteration
+`t`, so it overlaps that tile's A load and compute, and `__pipeline_wait_prior(1)`
+retires tile `t`'s batch while `t+1` stays in flight.
+
+Structure that makes the accounting work:
+
+    prologue:  prefetch tile 0 -> Bs[0];  commit
+    loop t:    if (t+1 < num_tiles) prefetch tile t+1 -> Bs[(t+1)%2]
+               commit                  // ALWAYS, even when skipped on the last tile
+               load As for tile t
+               wait_prior(1)           // two batches in flight, retires t's
+               __syncthreads()
+               compute from Bs[t%2]
+               __syncthreads()
+
+Three traps, all of which we hit:
+
+- **The commit must be unconditional.** `wait_prior(N)` counts batches, so
+  skipping the commit on the last iteration shifts the count and the wait
+  retires the wrong batch.
+- **`wait_prior` only covers the calling thread's own copies.** The compute reads
+  `Bs[kk][col..col+7]`, data copied by several threads. Correctness comes from
+  the pair: each thread waits for its own copies, then `__syncthreads()` makes
+  everyone else's visible.
+- **`prefetch` and the prologue must differ by exactly one tile.** Every bug we
+  had was the two drifting apart: fetching tile `t` where the compute also read
+  tile `t` (no pipelining at all), or starting the loop at `t = 1` (dropping
+  tile 0 from the sum). A shared lambda taking `(tile, buf)` makes the `+1` the
+  only difference.
+
+Note that `wait_prior` is not a barrier and `racecheck` does not flag an
+under-waiting pipeline -- it tracks shared-memory ordering, not async-copy
+completion. A wrong wait count passes every test and fails later.
+
+### Measured effect, 4096, from the .ncu-rep files
+
+    $ncu --set full -k rt_vectorized_AsBs -c 1 -o rt_V   ./build/test_gemm -p -c aligned rt_V_AsBs
+    $ncu --set full -k rt_async           -c 1 -o rt_async ./build/test_gemm -p -c aligned rt_async
+
+| | rt_V_AsBs (sync) | rt_async | delta |
+|---|---|---|---|
+| Duration | 21.64 ms | **20.19 ms** | **-6.7%** |
+| Elapsed cycles | 27.20 M | 26.09 M | -4.1% |
+| Compute (SM) throughput | 62.33% | 66.20% | +3.9 pts |
+| Warp cycles per issued inst | 6.18 | 5.83 | -5.7% |
+| Eligible warps per scheduler | 1.69 | 2.00 | +18% |
+| No-eligible cycles | 36.08% | 32.65% | -3.4 pts |
+| Executed IPC | 2.56 | 2.69 | +5.1% |
+| DRAM throughput | 29.24% | 26.05% | -10.9% |
+| Static shared per block | 16.4 KB | 32.8 KB | 2x |
+| Registers per thread | 96 | 99 | +3 |
+| Achieved occupancy | 32.94% | 32.58% | unchanged |
+
+**The win is latency hiding, not occupancy.** Both kernels sit at ~33% achieved
+occupancy, both capped at 2 blocks/SM by registers. What changed is that the
+warps already resident wait less: eligible warps per scheduler went up 18% and
+the scheduler found nothing to issue on 3.4 points fewer cycles.
+
+**The stall profile moved off the math.** In the sync kernel the two hottest
+SASS lines are `FFMA` at 11.0% and 10.1% of sampled stalls -- warps queued
+behind the FMA pipe while operands trickled in. In the async kernel the top
+entry is `LDS.128` at 10.4% and FFMA has dropped to 6.1%. Total sampled stall
+cycles fell 981K -> 946K. The bottleneck moved from waiting-to-compute toward
+shared-memory access, which is the next thing to attack.
+
+**DRAM throughput dropped while the kernel got faster.** Same bytes in less
+time at lower peak demand: `LDGSTS` streams global -> shared without the
+register round-trip, so the traffic is smoother instead of bursty.
+
+**Shared memory is now the next limiter.** 32.8 KB per block puts
+`Block Limit Shared Mem` at 3 while `Block Limit Registers` is 2, so registers
+still bind and occupancy is untouched -- but there is no headroom left. Any
+further shared growth, or dropping below ~85 registers, and shared memory
+becomes the cap.
+
+### Still in progress
+
+Double-buffering `As` as well is written but not finished (`prefetch_A`), and it
+currently regresses to 0.227 ms from 0.209 ms at 512/1024/1024. Two known bugs:
+`__pipeline_wait_prior(2)` never waits, because `prefetch_A` is synchronous and
+contributes no pipeline batches so only 2 are ever outstanding; and
+`prefetch_A` is called for both `tile+1` and `tile`, which loads every A tile
+twice -- 1,519,696 global load sectors against 1,003,186 for the sync kernel,
+about 51% more. The numbers in the table above predate those changes.
+
 
