@@ -428,17 +428,21 @@ completion. A wrong wait count passes every test and fails later.
 
 | | rt_V_AsBs (sync) | rt_async | delta |
 |---|---|---|---|
-| Duration | 21.64 ms | **20.19 ms** | **-6.7%** |
-| Elapsed cycles | 27.20 M | 26.09 M | -4.1% |
-| Compute (SM) throughput | 62.33% | 66.20% | +3.9 pts |
-| Warp cycles per issued inst | 6.18 | 5.83 | -5.7% |
+| Duration | 20.19 ms | **18.28 ms** | **-9.5%** |
+| Elapsed cycles | 26.86 M | 25.74 M | -4.2% |
+| Compute (SM) throughput | 63.68% | 67.39% | +3.7 pts |
+| Warp cycles per issued inst | 6.18 | 5.86 | -5.2% |
 | Eligible warps per scheduler | 1.69 | 2.00 | +18% |
-| No-eligible cycles | 36.08% | 32.65% | -3.4 pts |
-| Executed IPC | 2.56 | 2.69 | +5.1% |
-| DRAM throughput | 29.24% | 26.05% | -10.9% |
+| No-eligible cycles | 36.14% | 32.48% | -3.7 pts |
+| Memory throughput | 80.27% | 82.78% | +2.5 pts |
 | Static shared per block | 16.4 KB | 32.8 KB | 2x |
 | Registers per thread | 96 | 99 | +3 |
-| Achieved occupancy | 32.94% | 32.58% | unchanged |
+| Achieved occupancy | 32.87% | 32.79% | unchanged |
+
+Both captures come from the same binary minutes apart, with `As` and `Bs` both
+double-buffered. Durations here are larger than the harness reports (15.76 and
+15.36 ms) because ncu replays each launch and fixes clocks; use the harness for
+speed and ncu for the mechanism, and never mix the two in one comparison.
 
 **The win is latency hiding, not occupancy.** Both kernels sit at ~33% achieved
 occupancy, both capped at 2 blocks/SM by registers. What changed is that the
@@ -450,7 +454,9 @@ SASS lines are `FFMA` at 11.0% and 10.1% of sampled stalls -- warps queued
 behind the FMA pipe while operands trickled in. In the async kernel the top
 entry is `LDS.128` at 10.4% and FFMA has dropped to 6.1%. Total sampled stall
 cycles fell 981K -> 946K. The bottleneck moved from waiting-to-compute toward
-shared-memory access, which is the next thing to attack.
+shared-memory access, which is the next thing to attack. (Those two stall
+figures are from an earlier capture of the same two kernels; the shape of the
+result held up in the newer one.)
 
 **DRAM throughput dropped while the kernel got faster.** Same bytes in less
 time at lower peak demand: `LDGSTS` streams global -> shared without the
@@ -462,14 +468,81 @@ still bind and occupancy is untouched -- but there is no headroom left. Any
 further shared growth, or dropping below ~85 registers, and shared memory
 becomes the cap.
 
-### Still in progress
+### As is double-buffered too
 
-Double-buffering `As` as well is written but not finished (`prefetch_A`), and it
-currently regresses to 0.227 ms from 0.209 ms at 512/1024/1024. Two known bugs:
-`__pipeline_wait_prior(2)` never waits, because `prefetch_A` is synchronous and
-contributes no pipeline batches so only 2 are ever outstanding; and
-`prefetch_A` is called for both `tile+1` and `tile`, which loads every A tile
-twice -- 1,519,696 global load sectors against 1,003,186 for the sync kernel,
-about 51% more. The numbers in the table above predate those changes.
+`As` gets the same treatment as `Bs`: `prefetch_A(tile+1, (tile+1)%2)` alongside
+the B prefetch, with `prefetch_A(0, 0)` in the prologue. It stays synchronous --
+ordinary loads plus strided shared stores, because the transposed layout puts a
+thread's four values `BM+PAD` apart and `LDGSTS` cannot scatter -- so it
+contributes no pipeline batches and the wait count stays `wait_prior(1)`.
 
+Two mistakes worth recording, both of which passed the correctness check:
 
+- **`wait_prior(2)` never waits.** Adding a second prefetch does not add a batch
+  when that prefetch is synchronous, so only two are ever outstanding and "at
+  most 2" is satisfied on arrival.
+- **Prefetching both `tile+1` and `tile`** loads every A tile twice. Harmless
+  numerically, since the second write puts the same bytes in the same place, but
+  it doubles A's global traffic and leaves nothing to overlap.
+
+With both fixed, A-side traffic matches the synchronous kernel to within 0.5%
+(131,019,484 sectors against 130,339,738) -- i.e. each tile is fetched once.
+
+## cuBLAS as the ceiling
+
+`cublas` is registered like any other kernel but is not a rung on the ladder: it
+is the reference the others are measured against. `src/kernels/cublas_as_ref.cu`
+holds one `cublasSgemm` call, with the handle in a function-local static so it
+survives across launches -- `GemmFn` has nowhere to put one -- and built on first
+use so the harness's warmup launches absorb the milliseconds it costs.
+
+cuBLAS is column-major and our matrices are row-major, and nothing is transposed
+to bridge that. A row-major MxN matrix is bit-identical to a column-major NxM
+one, so asking for C^T = B^T * A^T gives row-major C: swap the operands, swap m
+and n, pass each matrix's row length as its leading dimension, both ops `_N`.
+
+`CUBLAS_PEDANTIC_MATH` keeps SGEMM in true FP32. Left at the default, cuBLAS may
+drop to TF32 on the tensor cores -- faster, but not the arithmetic our kernels do,
+so the comparison would be between two different computations. Verified with
+`NVIDIA_TF32_OVERRIDE=0`, which changes nothing, confirming FP32 either way.
+
+### 4096, best of three
+
+| kernel | ms | GFLOP/s | % of peak | % of cuBLAS |
+|---|---|---|---|---|
+| naive | 135.8 | 1012 | 6.3 | 10.8 |
+| smem | 107.8 | 1275 | 7.9 | 13.6 |
+| registerT | 17.40 | 7900 | 48.8 | 84.5 |
+| rt | 20.59 | 6674 | 41.2 | 71.3 |
+| rt_V_AsBs | 15.76 | 8723 | 53.8 | 93.2 |
+| **rt_async** | **15.36** | **8951** | **55.2** | **95.6** |
+| cublas | 14.67 | 9369 | 57.8 | 100 |
+
+`rt_async` reaches 95.6% of cuBLAS, with both tiles double-buffered and each A
+tile fetched once.
+
+### The tolerance had to scale with K
+
+cuBLAS "failed" the old fixed `1e-4` at 4096 with `1.874e-04`, and it was right
+to. The check is really "agrees with a sequential FP32 sum": our kernels
+accumulate in increasing k exactly like `gemm_cpu` and stay at `4.489e-05` even
+at K=4096, while cuBLAS splits K and reduces in a tree, which drifts further from
+the sequential sum -- and is arguably the more accurate of the two, leaving the
+CPU reference as the outlier. The deviation also grows with K: `8.048e-05` at
+K=1025, `1.874e-04` at K=4096.
+
+So the tolerance is now `1e-4 * sqrt(K/1024)`, the random-walk growth of
+independently rounded partial sums:
+
+| shape | K | tol | our kernels | cuBLAS |
+|---|---|---|---|---|
+| aligned | 4096 | 2.0e-04 | 4.489e-05 | 1.874e-04 |
+| ragged | 1025 | 1.0e-04 | 2.781e-05 | 8.048e-05 |
+
+This costs nothing in detection power. At the ragged shape the tolerance is
+essentially unchanged from the old fixed value, and the off-by-one column guard
+that shape exists to catch still reports `4.2e+01` -- five orders of magnitude of
+margin. Each case prints the tolerance in effect in its header.
+
+Note that `cublas` is currently the only fast kernel that runs the ragged shape:
+`rt_V_AsBs` and `rt_async` abort there on `assert(M % 4 == 0)`.
