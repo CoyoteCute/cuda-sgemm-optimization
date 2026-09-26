@@ -28,8 +28,8 @@ const Case cases[] = {
     // Every dim a multiple of 32, so no kernel in the ladder ever runs a partial
     // tile here. This is the shape the GFLOP/s numbers in docs/PLAN.md refer to;
     // don't change it without restating the baseline.
-    //{"aligned", 4096, 4096, 4096, true},
-    {"aligned", 512, 1024, 1024, true},
+    {"aligned", 4096, 4096, 4096, true},
+    //{"aligned", 512, 1024, 1024, true},
 
     // Deliberately awkward: M and N are 32k+1, so the last tile in each axis has
     // exactly one valid row and one valid column, and K is not a multiple of
