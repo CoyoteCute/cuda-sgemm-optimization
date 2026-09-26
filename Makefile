@@ -23,7 +23,7 @@ test: build/test_gemm
 
 build/test_gemm: $(OBJ)
 	@mkdir -p $(dir $@)
-	$(NVCC) -arch=$(ARCH) $^ -Xcompiler -fopenmp -o $@
+	$(NVCC) -arch=$(ARCH) $^ -Xcompiler -fopenmp -lcublas -o $@
 
 build/%.o: %.cu
 	@mkdir -p $(dir $@)

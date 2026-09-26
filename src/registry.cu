@@ -7,7 +7,8 @@ const Kernel kernels[] = {
     {"registerT", launch_registerT},
     {"rt", launch_rt},
     {"rt_V_AsBs", launch_rt_V_AsBs},
-    {"rt_async", launch_rt_async}
+    {"rt_async", launch_rt_async},
+    {"cublas", launch_cublas}
     //{"wt", launch_wt}
 };
 

@@ -38,10 +38,19 @@ const Case cases[] = {
 };
 const int num_cases = sizeof(cases) / sizeof(cases[0]);
 
-// FP32 accumulation over K=1024 lands near 2e-5 against the CPU reference, which
-// also sums in float but in a different order; see the acceptance note in docs/PLAN.md. This catches a broken
-// kernel, not a differently-rounded one.
-constexpr double kTol = 1e-4;
+// Tolerance at K=1024, where FP32 accumulation lands near 2e-5 against the CPU
+// reference -- also float, but summed in a different order; see the acceptance
+// note in docs/PLAN.md. This catches a broken kernel, not a differently-rounded one.
+constexpr double kTolAtK1024 = 1e-4;
+
+// The error grows with K, so a fixed tolerance is only calibrated for one shape.
+// Worse, it is really "agrees with a sequential sum": our kernels accumulate in
+// increasing k exactly like gemm_cpu and stay near 4e-5 even at K=4096, while
+// cuBLAS splits K and reduces in a tree and drifts to 1.9e-4 -- arguably the more
+// accurate of the two, with the sequential CPU sum as the outlier. Scaling by
+// sqrt(K) tracks the random-walk growth of independently rounded partial sums and
+// admits both, while still being orders of magnitude away from a broken kernel.
+inline double tol_for(int K) { return kTolAtK1024 * sqrt(K / 1024.0); }
 
 constexpr double kPeakGflops = 16200.0;   // RTX 3060 Ti, FP32
 
@@ -54,8 +63,11 @@ constexpr double kPeakGflops = 16200.0;   // RTX 3060 Ti, FP32
 int run_case(const Case& cs, const char* filter, bool check, bool profile, int* ran)
 {
     const int M = cs.M, K = cs.K, N = cs.N;
+    const double tol = tol_for(K);
 
-    printf("\n=== %s   M=%d K=%d N=%d ===\n", cs.name, M, K, N);
+    printf("\n=== %s   M=%d K=%d N=%d", cs.name, M, K, N);
+    if (check) printf("   tol %.1e", tol);
+    printf(" ===\n");
 
     float* A     = new float[M*K];
     float* B     = new float[K*N];
@@ -91,8 +103,8 @@ int run_case(const Case& cs, const char* filter, bool check, bool profile, int* 
 
         if (check) {
             CUDA_CHECK(cudaMemcpy(C, dC, M*N*sizeof(float), cudaMemcpyDeviceToHost));
-            double max_rel = compare_mat(C, C_cpu, M, N, K, kTol);
-            const bool pass = max_rel < kTol;
+            double max_rel = compare_mat(C, C_cpu, M, N, K, tol);
+            const bool pass = max_rel < tol;
             printf("  max rel err: %.3e  [%s]\n", max_rel, pass ? "pass" : "FAIL");
             if (!pass) { ++failures; continue; }
         } else {
@@ -145,7 +157,7 @@ int main(int argc, char** argv)
 
     if      (profile) printf("profile mode: no reference, no check, no timing");
     else if (!check)  printf("no check: no reference, timing only");
-    else              printf("reference: CPU   tol %.0e", kTol);
+    else              printf("reference: CPU   tol %.0e*sqrt(K/1024)", kTolAtK1024);
     if (filter)    printf("   filter \"%s\"", filter);
     if (only_case) printf("   case \"%s\"", only_case);
     printf("\n");
