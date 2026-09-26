@@ -130,31 +130,42 @@ Verify the toolchain and profiler counter access:
     `harness.cuh` rebuilds exactly the objects that included it. `make` reporting
     `Nothing to be done for 'all'` means the binary is genuinely current.
 
-## Current state 
-    $ ./build/test_gemm -c aligned
-    reference: CPU   tol 1e-04   case "aligned"
+## Current state
 
-    === aligned   M=512 K=1024 N=1024 ===
+    $ ./build/test_gemm -c aligned
+    reference: CPU   tol 1e-04*sqrt(K/1024)   case "aligned"
+
+    === aligned   M=4096 K=4096 N=4096   tol 2.0e-04 ===
     [naive]
-    worst at (288,0): gpu=0.025224 ref=0.025216
-    max rel err: 2.382e-05  [pass]
-        1.202 ms     893.17 GFLOP/s    5.51% of peak
+      worst at (98,1659): gpu=0.003127 ref=0.003098
+      max rel err: 4.489e-05  [pass]
+       135.294 ms    1015.86 GFLOP/s    6.27% of peak
     [smem]
-    worst at (288,0): gpu=0.025224 ref=0.025216
-    max rel err: 2.382e-05  [pass]
-        0.977 ms    1099.28 GFLOP/s    6.79% of peak
+      worst at (98,1659): gpu=0.003127 ref=0.003098
+      max rel err: 4.489e-05  [pass]
+       107.548 ms    1277.94 GFLOP/s    7.89% of peak
     [registerT]
-    worst at (288,0): gpu=0.025224 ref=0.025216
-    max rel err: 2.382e-05  [pass]
-        0.240 ms    4468.56 GFLOP/s   27.58% of peak
+      worst at (98,1659): gpu=0.003127 ref=0.003098
+      max rel err: 4.489e-05  [pass]
+        17.433 ms    7884.03 GFLOP/s   48.67% of peak
     [rt]
-    worst at (288,0): gpu=0.025224 ref=0.025216
-    max rel err: 2.382e-05  [pass]
-        0.260 ms    4128.25 GFLOP/s   25.48% of peak
+      worst at (98,1659): gpu=0.003127 ref=0.003098
+      max rel err: 4.489e-05  [pass]
+        20.527 ms    6695.49 GFLOP/s   41.33% of peak
     [rt_V_AsBs]
-    worst at (288,0): gpu=0.025224 ref=0.025216
-    max rel err: 2.382e-05  [pass]
-        0.232 ms    4619.28 GFLOP/s   28.51% of peak
+      worst at (98,1659): gpu=0.003127 ref=0.003098
+      max rel err: 4.489e-05  [pass]
+        15.684 ms    8763.24 GFLOP/s   54.09% of peak
+    [rt_async]
+      worst at (98,1659): gpu=0.003127 ref=0.003098
+      max rel err: 4.489e-05  [pass]
+        15.267 ms    9002.48 GFLOP/s   55.57% of peak
+    [cublas]
+      worst at (1351,2513): gpu=-0.048536 ref=-0.048665
+      max rel err: 1.874e-04  [pass]
+        14.568 ms    9434.01 GFLOP/s   58.23% of peak
+
+    7/7 passed
 
 **aligned** has every dim a multiple of 32, so no kernel in the ladder ever
 runs a partial tile. It carries the sweep: the GFLOP/s in `docs/PLAN.md` are
@@ -164,7 +175,7 @@ this shape, so changing it means restating the baseline.
 column in the final tile -- 31 of every 32 threads there must be masked off. It
 is correctness-only and deliberately untimed. This is the case that catches a
 bad bounds guard: an off-by-one column test (`col <= N` instead of `col < N`) passes
-the aligned shape clean, because the grid covers N=1024 exactly and the extra
+the aligned shape clean, because there the grid covers N exactly and the extra
 column is never generated, and fails ragged at `4.2e+01`.
 
 A and B come from fixed seeds (42 / 1337), and `dC` is zeroed before each
@@ -255,29 +266,30 @@ DRAM, and that costs far more than the extra block per SM buys:
 | no launch bounds | 128 | none | 0.242 | 4443 |
 | `__launch_bounds__(256, 3)` | 80 | 764 B stores, 684 B loads | 0.942 | 1140 |
 
-### rt_V_Bs and rt_V_BsAs
+### rt_V_AsBs and rt
 
 Both start from `registerT` and change only how the tiles reach shared memory.
 
-- **rt_V_Bs** loads both `As` and `Bs` with one `float4` per thread per tile, and
+- **rt_V_AsBs** loads both `As` and `Bs` with one `float4` per thread per tile, and
   holds `As` transposed as `[BK][BM]`. The transposed store is four strided
   scalars, but the compute loop then reads `As[kk][row..row+7]` as two `float4`s,
   and that read happens on every one of the `BK` steps while the store happens
   once. It also carries bounds checks, which `registerT` does not.
-- **rt_V_BsAs** keeps `As` in `[BM][BK]` order with scalar loads.
+- **rt** keeps `As` in `[BM][BK]` order with scalar loads.
 
 At M=K=N=4096, BK=16, best of three runs:
 
 | kernel | ms | GFLOP/s | % of peak |
 |---|---|---|---|
-| naive | 140.7 | 977 | 6.0 |
-| smem | 111.7 | 1231 | 7.6 |
-| registerT | 17.7 | 7748 | 47.8 |
-| **rt_V_Bs** | **16.1** | **8559** | **52.8** |
-| rt_V_BsAs | 20.6 | 6656 | 41.1 |
+| naive | 135.8 | 1012 | 6.3 |
+| smem | 107.8 | 1275 | 7.9 |
+| registerT | 17.40 | 7900 | 48.8 |
+| **rt_V_AsBs** | **15.76** | **8723** | **53.8** |
+| rt | 20.59 | 6674 | 41.2 |
 
-`rt_V_Bs` is the fastest so far, and it beats `registerT` while also doing the
-bounds checks `registerT` skips.
+`rt_V_AsBs` beats `registerT` by 10% while also doing the bounds checks
+`registerT` skips. It held the lead until `rt_async` (see Double buffering) took
+it with the async copy; `cublas` is ahead of both.
 
 **Measure more than once.** Run-to-run spread on this machine is around 7%, which
 is larger than several of the effects below. A single pair of runs made BK=16
@@ -285,16 +297,18 @@ look 10% better than BK=8; three runs each showed that was noise.
 
 #### BK sweep, 4096, best of three
 
-| BK | rt_V_Bs | rt_V_BsAs | smem per block |
+Measured when these two were the newest kernels, before `rt_async` and `cublas`.
+
+| BK | rt_V_AsBs | rt | smem per block |
 |---|---|---|---|
 | 8 | 16.02 ms | 23.34 ms | 8 KB |
 | 16 | 16.07 ms | 20.67 ms | 16 KB |
 | 32 | 16.18 ms | 19.62 ms | 32 KB |
 
-BK does nothing for `rt_V_Bs` and a lot for `rt_V_BsAs`. `rt_V_Bs` already moves
+BK does nothing for `rt_V_AsBs` and a lot for `rt`. `rt_V_AsBs` already moves
 each tile with one `LDG.128` per thread, so there is little per-tile overhead
-left to amortize; `rt_V_BsAs` issues many more load instructions per tile, so a
-longer K step spreads that cost over more work. `rt_V_Bs` stays register-limited
+left to amortize; `rt` issues many more load instructions per tile, so a
+longer K step spreads that cost over more work. `rt_V_AsBs` stays register-limited
 at 96 registers, 2 blocks per SM, so the extra shared memory is free either way.
 
 #### PAD does not pay here
@@ -360,7 +374,7 @@ use 4096 for M, N, K. This shows the real occupancy because all SMs get blocks t
 ## As transpose and vectorization
 transposing As and padding TM to TM+4 was performance-neutral on sm_86 with CUDA 12.9, because ptxas already vectorized the strided reads. The 2-way read conflict it removes is offset by the extra store traffic.
 === aligned   M=4096 K=4096 N=4096 ===
-rt_vectorized_Bs_As
+rt_kernel
 -------------------------------------------------------- ----------- ------------
     Metric Name                                              Metric Unit Metric Value
     -------------------------------------------------------- ----------- ------------
@@ -369,7 +383,7 @@ rt_vectorized_Bs_As
     smsp__inst_executed.sum                                         inst   2535022592
     -------------------------------------------------------- ----------- ------------
 === aligned   M=4096 K=4096 N=4096 ===
-rt_vectorized_Bs    
+rt_vectorized_AsBs    
 -------------------------------------------------------- ----------- ------------
     Metric Name                                              Metric Unit Metric Value
     -------------------------------------------------------- ----------- ------------
@@ -379,7 +393,7 @@ rt_vectorized_Bs
     -------------------------------------------------------- ----------- ------------
 **Update, once the transpose was finished.** The note above was written while
 `As` was still indexed in the old order. With the store transposed *and* the
-compute-loop read switched to two `float4`s, `rt_V_Bs` went 20.2 ms -> 16.3 ms
+compute-loop read switched to two `float4`s, `rt_V_AsBs` went 20.2 ms -> 16.3 ms
 at 4096, a 21% gain, and it is now the fastest kernel in the ladder. Padding
 on top of that is still a loss; see "PAD does not pay here" above.
 

@@ -1,5 +1,19 @@
+// ===========================================================================
+// PLACEHOLDER -- DO NOT USE. NOT A WARP-TILED KERNEL YET.
+//
+// wt_kernel below is still a verbatim copy of rt_kernel from
+// register_tiling_vectorized.cu, renamed so the two do not collide at link
+// time. Warp tiling is not implemented: there is no warp-level decomposition
+// here at all, and the WARPS_PER_BLOCK / LANES_M constants are declared but
+// unused. It measures exactly what `rt` measures, because it IS `rt`.
+//
+// Its registry entry in src/registry.cu is commented out on purpose, so `wt`
+// does not show up in test_gemm runs and cannot be mistaken for a result.
+// Uncomment that line only once this file actually differs from rt_kernel.
+// ===========================================================================
+
 #include <cuda_runtime.h>
-#include <cassert> 
+#include <cassert>
 #include "gemm.h"
 #include "kernels/kernels.h"
 
