@@ -7,6 +7,28 @@
 | Toolkit | CUDA 12.9 (nvcc V12.9.86), driver 615.65.06 |
 | Profiler | Nsight Compute 2025.2.1 |
 
+### Peak throughput, measured
+
+Not taken from a spec sheet. Measured with a kernel that does nothing but
+back-to-back `mma_sync` on register-resident fragments, four independent
+accumulators deep so it is throughput-bound rather than latency-bound:
+
+| | GFLOP/s | vs FP32 |
+|---|---|---|
+| FP32 CUDA cores (2 x 128 x 38 SM x 1.665 GHz) | 16197 | 1.0x |
+| TF32 tensor cores (m16n16k8) | 16186 | **1.0x** |
+| FP16 / BF16 tensor cores, FP32 accumulate (m16n16k16) | 32366 | 2.0x |
+
+**TF32 has the same peak as FP32 on this GPU** -- within 0.07%. The 4x and 8x
+figures in Ampere marketing material are either the sparsity numbers or refer to
+datacenter GA100, whose FP32 is comparatively weak. On consumer GA10x, dense TF32
+lands exactly on the FP32 line and dense FP16 is 2x it.
+
+So `% of peak` is directly comparable between the FP32 and TF32 kernels: both are
+bounded by the same 16.2 TFLOP/s, and the tensor-core kernels reach a higher
+fraction of it because they need far fewer instructions per FLOP. FP16 or BF16
+would be the first precision where the ceiling actually moves.
+
 Under WSL, `ncu` fails with `ERR_NVGPUCTRPERM` until GPU performance
 counters are opened up in the Windows NVIDIA Control Panel
 (Desktop → Enable Developer Settings, then Developer → Manage GPU
@@ -560,3 +582,139 @@ margin. Each case prints the tolerance in effect in its header.
 
 Note that `cublas` is currently the only fast kernel that runs the ragged shape:
 `rt_V_AsBs` and `rt_async` abort there on `assert(M % 4 == 0)`.
+
+## Tensor cores: wmma with tf32
+
+Two kernels. `wmma_tf32.cu` is the teaching version: one warp, one 16x16 tile of
+C, no shared memory at all, because `load_matrix_sync` reads straight from
+global. `wmma_tiled.cu` is the real one, templated on the tile shape.
+
+The mental shift from every kernel before these: no thread owns an element. The
+warp collectively owns a tile, and **every lane must pass the same address** to
+each wmma call. A `threadIdx`-derived pointer means 32 lanes asking for 32
+different tiles.
+
+`tf32` fragments are **m16n16k8**. `16x16x16` does not exist for tf32 -- it is an
+incomplete type -- so the K loop steps by 8.
+
+### Three nested levels
+
+    block tile   BM x BN   staged in shared memory, BK deep
+    warp tile    WM x WN   one warp's share of it
+    fragment     16 x 16   what mma_sync does, K=8 at a time
+
+Each warp keeps `(WM/16)*(WN/16)` accumulator fragments live across the whole K
+loop -- the same idea as the 8x8 register tile in `rt_async`, one level up. That
+is where the reuse comes from: one `a` fragment feeds `WN/16` mma calls and one
+`b` fragment feeds `WM/16`.
+
+The four constraints that pick a configuration:
+
+| | formula | limit |
+|---|---|---|
+| warps per block | `(BM/WM)*(BN/WN)` | 32 threads each |
+| shared memory | `(BM*(BK+PAD) + BK*(BN+PAD))*4` | 48 KB static on sm_86 (verified: 48 compiles, 64 gives `0xc000 max`) |
+| accumulator regs/lane | `8*(WM/16)*(WN/16)` | each accumulator fragment is 256 floats / 32 lanes |
+| a+b fragment regs/lane | `4*(WM/16 + WN/16)` | each tf32 16x8 fragment is 128 elements / 32 lanes |
+
+### The sweep, 4096, best of three
+
+Every variant is a template instantiation registered as its own kernel, so one
+`./build/test_gemm -c aligned wmma` measures the whole space in one process
+against one reference -- no rebuilding between points, which is how the earlier
+BK sweep let a 7% noise band look like a 10% win.
+
+| variant | BM x BN | BK | WM x WN | PAD | ms | GFLOP/s | % peak | regs | smem |
+|---|---|---|---|---|---|---|---|---|---|
+| wmma_tf32 | 16x16 | 8 | - | - | 29.86 | 4602 | 28.4 | - | 0 |
+| wmma_64x64 | 64x64 | 16 | 32x32 | 0 | 13.80 | 9961 | 61.5 | 72 | 8 KB |
+| wmma_128x64 | 128x64 | 16 | 64x32 | 0 | 11.61 | 11841 | 73.1 | 128 | 12 KB |
+| wmma_128x128 | 128x128 | 16 | 64x32 | 0 | 12.81 | 10725 | 66.2 | 128 | 16 KB |
+| wmma_128x128_w32x64 | 128x128 | 16 | 32x64 | 0 | 12.28 | 11194 | 69.1 | 128 | 16 KB |
+| wmma_128x128_bk32 | 128x128 | 32 | 64x32 | 0 | 15.39 | 8928 | 55.1 | 144 | 32 KB |
+| **wmma_128x128_pad4** | 128x128 | 16 | 64x32 | **4** | **11.31** | **12154** | **75.0** | 128 | 18.25 KB |
+
+For comparison from the same run: `rt_async` 16.27 ms (52.2%), `cublas` 15.29 ms
+(55.5%). Both are true FP32, and TF32 shares the FP32 peak on this GPU, so the
+percentages are directly comparable: the tensor-core kernel reaches 75% of the
+same ceiling the best FP32 kernel reaches 52% of. No spills in any variant.
+
+- **Shared-memory staging is worth 2.6x** (29.86 -> 11.31). Same lesson as
+  `naive` -> `smem`: the one-warp kernel fetched from global for every fragment
+  with no reuse at all.
+- **BK=32 is a clear loss.** It doubles shared memory and pushes registers to 144
+  for nothing -- the fragment loads were already amortized over the warp tile.
+- **Warp shape matters independently of block shape.** Same 128x128 block, same
+  register count: 64x32 gives 12.81, 32x64 gives 12.28.
+- **`wmma_128x64` and `wmma_128x128_pad4` are 2.6% apart**, at the edge of the
+  noise band. Treat as close.
+
+### PAD=4 helps here, and hurt in sgemm
+
+Measured on the same configuration, PAD 0 vs 4:
+
+| | shared-load bank conflicts | wavefronts | ms |
+|---|---|---|---|
+| PAD=0 | 301,989,888 | 403,261,633 | 12.81 |
+| PAD=4 | 33,554,432 | 134,332,403 | 11.31 |
+
+9x fewer conflicts, 3x fewer wavefronts, 12% faster. The reason is the stride.
+`load_matrix_sync` for `matrix_a` reads **16 different rows** of `As`, 8
+consecutive floats each, rows `LDA = BK+PAD` apart, so row `r` starts at bank
+`(r*LDA) mod 32`:
+
+    LDA=16:  rows 0,2,4,..14 -> bank 0;  rows 1,3,5,..15 -> bank 16
+             two distinct start banks for 16 rows, 8-way conflict,
+             and banks 8-15 / 24-31 idle. 16 divides 32: the worst case.
+
+    LDA=20:  0, 20, 8, 28, 16, 4, 24, 12, then repeats
+             gcd(20,32)=4 gives eight distinct start banks, 2-way conflict.
+
+301.99M / 33.55M is exactly 9, which is the 8-way-to-nearly-conflict-free ratio.
+
+This is the **opposite** of the sgemm finding in "PAD does not pay here", and the
+two do not contradict: in `rt_async` the compute loop read `As[kk][row..row+7]`
+*along* a row, already conflict-free, so the row stride was irrelevant and
+padding only broke the `float4` alignment. Here the fragment load reads *across*
+rows, so the row stride is the only thing that matters. Same knob, opposite sign,
+because the consumer changed -- which is why `PAD` is a template parameter and
+not a constant.
+
+### Reduced precision in the harness
+
+`Kernel` gained two defaulted fields, so no existing entry changed:
+
+    Prec   prec      = Prec::FP32;   // A and B are pre-rounded to this
+    double tol_scale = 1.0;          // multiplies the shape's tolerance
+
+The driver rounds A and B to the kernel's precision on the host and **recomputes
+the CPU reference from those same rounded values**. The input-rounding error then
+cancels out of the comparison instead of showing up as a difference, so the
+tolerance only has to cover accumulation order. Verified: host `round_to_prec`
+matches `wmma::__float_to_tf32` bit-for-bit on 100,000 values, 0 mismatches. It
+is worth 40x -- max rel err goes from 3.607e-02 without pre-rounding to 9.056e-04
+with it.
+
+`tol_scale = 10` for the tf32 kernels is measured, not guessed. A single
+`mma_sync` is 2.4e-06 from an exact double reference, so the tensor core is not
+the problem; the error is FP32 accumulation order, and it grows with K against
+exact double:
+
+| K | worst rel vs exact double |
+|---|---|
+| 8 (one mma) | 2.398e-06 |
+| 64 | 6.207e-06 |
+| 512 | 1.414e-04 |
+| 4096 | 3.943e-04 |
+
+The accumulator tree-sums 8 terms in hardware then chains 512 mma results, an
+order `gemm_cpu`'s strictly sequential sum cannot reproduce. The FP32 kernels hit
+4.489e-05 precisely because they *do* accumulate in that order. Measured 9.1e-04
+at 4096, so 10x the shape tolerance leaves 2x margin while staying three orders
+below anything structurally broken.
+
+### Not done yet
+
+`__pipeline_memcpy_async` and double buffering, which are worth ~9% on
+`rt_async`. Deliberately left out so the tiling change could be attributed on its
+own. `wmma_128x128_pad4` at 75% of peak is the obvious kernel to try them on.
