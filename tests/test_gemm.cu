@@ -52,7 +52,18 @@ constexpr double kTolAtK1024 = 1e-4;
 // admits both, while still being orders of magnitude away from a broken kernel.
 inline double tol_for(int K) { return kTolAtK1024 * sqrt(K / 1024.0); }
 
-constexpr double kPeakGflops = 16200.0;   // RTX 3060 Ti, FP32
+// Measured peaks, not spec-sheet numbers -- see the Environment table in
+// README.md. TF32 sits on the FP32 line on consumer GA10x (16186 vs 16197
+// GFLOP/s measured), so the FP32 and TF32 kernels' "% of peak" are directly
+// comparable. FP16/BF16 is the first precision where the ceiling moves.
+inline double peak_for(Prec p)
+{
+    switch (p) {
+        case Prec::FP16:
+        case Prec::BF16: return 32366.0;
+        default:         return 16197.0;   // FP32 and TF32
+    }
+}
 
 // Runs every kernel matching `filter` on one shape. Adds the number of kernels
 // run to *ran, returns how many of them failed. With `check` off, the CPU
@@ -76,14 +87,40 @@ int run_case(const Case& cs, const char* filter, bool check, bool profile, int* 
 
     fill_mat(A, M, K, 42);
     fill_mat(B, K, N, 1337);
-    if (check) gemm_cpu(A, B, C_cpu, M, K, N);
 
     float *dA, *dB, *dC;
     CUDA_CHECK(cudaMalloc((void**)&dA, M*K*sizeof(float)));
     CUDA_CHECK(cudaMalloc((void**)&dB, K*N*sizeof(float)));
     CUDA_CHECK(cudaMalloc((void**)&dC, M*N*sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(dA, A, M*K*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dB, B, K*N*sizeof(float), cudaMemcpyHostToDevice));
+
+    // A and B are rounded to the precision the kernel actually computes in, and
+    // the reference is recomputed from those same rounded values -- so the
+    // comparison never charges a reduced-precision kernel for its input
+    // rounding, only for its accumulation order. Kept until the next kernel
+    // wants a different precision, so grouping the registry by precision avoids
+    // recomputing the CPU reference.
+    float* A_r = nullptr;   // rounded copies, allocated on first non-FP32 kernel
+    float* B_r = nullptr;
+    int uploaded = -1;      // Prec currently in dA/dB and in C_cpu; -1 = nothing
+
+    auto prepare = [&](Prec p)
+    {
+        if (uploaded == (int)p) return;
+
+        const float* Au = A;
+        const float* Bu = B;
+        if (p != Prec::FP32) {
+            if (!A_r) { A_r = new float[(size_t)M*K]; B_r = new float[(size_t)K*N]; }
+            round_to_prec(A_r, A, (size_t)M*K, p);
+            round_to_prec(B_r, B, (size_t)K*N, p);
+            Au = A_r;
+            Bu = B_r;
+        }
+        CUDA_CHECK(cudaMemcpy(dA, Au, M*K*sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dB, Bu, K*N*sizeof(float), cudaMemcpyHostToDevice));
+        if (check) gemm_cpu(Au, Bu, C_cpu, M, K, N);
+        uploaded = (int)p;
+    };
 
     int failures = 0;
 
@@ -92,7 +129,14 @@ int run_case(const Case& cs, const char* filter, bool check, bool profile, int* 
         if (filter && !strstr(k.name, filter)) continue;
         ++*ran;
 
-        printf("[%s]\n", k.name);
+        const double ktol = tol * k.tol_scale;
+
+        printf("[%s]", k.name);
+        if (k.prec != Prec::FP32)  printf("   inputs %s", prec_name(k.prec));
+        if (k.tol_scale != 1.0)    printf("   tol %.1e", ktol);
+        printf("\n");
+
+        prepare(k.prec);
 
         // Zeroed first, so an element the kernel never writes reads back as 0
         // and shows up as an error instead of as leftover state from last run.
@@ -103,8 +147,8 @@ int run_case(const Case& cs, const char* filter, bool check, bool profile, int* 
 
         if (check) {
             CUDA_CHECK(cudaMemcpy(C, dC, M*N*sizeof(float), cudaMemcpyDeviceToHost));
-            double max_rel = compare_mat(C, C_cpu, M, N, K, tol);
-            const bool pass = max_rel < tol;
+            double max_rel = compare_mat(C, C_cpu, M, N, K, ktol);
+            const bool pass = max_rel < ktol;
             printf("  max rel err: %.3e  [%s]\n", max_rel, pass ? "pass" : "FAIL");
             if (!pass) { ++failures; continue; }
         } else {
@@ -117,13 +161,14 @@ int run_case(const Case& cs, const char* filter, bool check, bool profile, int* 
         float ms = time_kernel([&]{ k.launch(dA, dB, dC, M, K, N); });
         double gflops = 2.0 * M * N * K / (ms * 1e6);
         printf("  %8.3f ms   %8.2f GFLOP/s   %5.2f%% of peak\n",
-               ms, gflops, 100.0 * gflops / kPeakGflops);
+               ms, gflops, 100.0 * gflops / peak_for(k.prec));
     }
 
     CUDA_CHECK(cudaFree(dA));
     CUDA_CHECK(cudaFree(dB));
     CUDA_CHECK(cudaFree(dC));
     delete[] A; delete[] B; delete[] C; delete[] C_cpu;
+    delete[] A_r; delete[] B_r;
 
     return failures;
 }
